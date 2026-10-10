@@ -21,3 +21,5 @@ Add API and UI automated tests (including filter/summary/export parity), persist
 ## AI narrative summary
 
 The optional AI feature is a separate FastAPI project in `python-ai`. The browser calls only the .NET `GET /api/risk-positions/summary/ai` endpoint. .NET applies the requested filters and computes the authoritative summary, then posts the aggregates (not individual trade rows) to Python. Python validates the camelCase payload, invokes a LangChain agent backed by Groq, and returns a short narrative. `GROQ_API_KEY` and optional LangSmith tracing credentials remain in the Python service's untracked `.env`; no model credentials are sent to the browser. The prompt asks the model to stick to supplied figures and avoid combining quantities across different commodities. A configured model-provider credential is required for live AI responses; health and test routes work without it.
+
+To enable live AI responses, create a Groq API key at [console.groq.com/keys](https://console.groq.com/keys) and set it as `GROQ_API_KEY` in `python-ai/.env`.

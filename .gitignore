@@ -42,7 +42,7 @@ pnpm-debug.log*
 
 # Environment files (keep the Python project's .env)
 **/.env
-!python-ai/.env
+
 
 # Logs and editor / OS files
 **/*.log
