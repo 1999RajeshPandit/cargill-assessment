@@ -1,35 +1,55 @@
 # Corporate Risk Reporting (CRR)
 
-A full-stack risk-position reporting slice built with .NET 10, React, TypeScript, AG Grid Community, and a separate Python AI summary API. It serves the supplied 50,000-row dataset through a server-paginated API and reports filtered totals across the complete matching result set.
+A full-stack risk-position reporting app built with .NET 10, React, TypeScript, AG Grid Community, PostgreSQL, and a separate Python AI summary API. The supplied CSV contains 50,000 positions.
 
-## Product preview
+> **Want to skip PostgreSQL setup?** Switch to the `csv_in_memory` branch with `git checkout csv_in_memory`. That branch loads the CSV into memory, so you can go straight to [Run all three applications](#run-all-three-applications).
 
-![Product screenshot](./product-image.png)
+## PostgreSQL setup
 
-[Watch the product recording](<./product recording.mp4>)
+Complete these steps from the repository root before starting the API on the current branch.
+
+1. Install PostgreSQL and make sure the server is running. Create a database named `crr` if it does not already exist; for example, run `createdb -U postgres crr` from a terminal with PostgreSQL's command-line tools installed.
+2. Check `backend/Crr.Api/appsettings.json` and update `ConnectionStrings:RiskPositions` for your PostgreSQL host, database, username, and password. You can override this setting with .NET user-secrets or the `ConnectionStrings__RiskPositions` environment variable.
+3. Install the EF Core command-line tool once:
+
+   ```powershell
+   dotnet tool install --global dotnet-ef --version 10.0.12
+   ```
+
+4. Apply the schema migration:
+
+   ```powershell
+   dotnet ef database update --project backend/Crr.Api/Crr.Api.csproj
+   ```
+
+5. Import the CSV:
+
+   ```powershell
+   dotnet run --project backend/Crr.Api -- --import-csv risk_positions.csv
+   ```
+
+The importer validates the header, fields, and values, rejects duplicate trade IDs, and loads rows with PostgreSQL `COPY` in a transaction. If the import fails, the transaction is rolled back. It rejects IDs that already exist in the database, so do not run it again after a successful import unless you have cleared the imported rows.
 
 ## Requirements
 
 - .NET 10 SDK
 - Node.js 20+ and npm
 - Python 3.11+
+- PostgreSQL for the current branch; PostgreSQL is not needed on `csv_in_memory`
 
-## Run locally
+## Run all three applications
 
-Open three terminals from the repository root.
+Start each application in a separate terminal from the repository root. On the current branch, finish [PostgreSQL setup](#postgresql-setup) first.
 
-**Terminal 1 — API**
+### 1. .NET API
 
 ```powershell
 dotnet run --project backend/Crr.Api
 ```
 
-The API listens on `http://localhost:5080`. Check `http://localhost:5080/api/health` for a health response.
-Interactive API documentation is available at `http://localhost:5080/swagger` (OpenAPI JSON: `/swagger/v1/swagger.json`).
+The API listens on `http://localhost:5080`. Check `http://localhost:5080/api/health`. Swagger UI is at `http://localhost:5080/swagger/index.html` and the OpenAPI document is at `http://localhost:5080/swagger/v1/swagger.json`.
 
-If Swagger displays **Failed to fetch** and the browser reports `ERR_CONNECTION_REFUSED`, the API is not listening on port 5080. Start the backend and keep that terminal running while using Swagger. This is a server availability issue, not CORS; Swagger UI and the API share the same origin. If the API is running but the React app cannot call it, verify it was launched on port 5080 and that the frontend uses `http://localhost:5173` or `http://127.0.0.1:5173` (the configured development CORS origins).
-
-**Terminal 2 — frontend**
+### 2. React frontend
 
 ```powershell
 cd frontend
@@ -37,59 +57,76 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:5173`. The Vite development server proxies `/api` requests to the .NET API on port 5080.
 
-**Terminal 3 — Python AI summary API**
+### 3. Python AI summary API
+
+Set `GROQ_API_KEY` in `python-ai/.env` to enable AI-generated summaries, then start the service:
+You can create `GROQ_API_KEY` from https://console.groq.com/keys its free
 
 ```powershell
 cd python-ai
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
-
-Set `GROQ_API_KEY` in `python-ai/.env` (do not commit that file), then start the AI API:
 
 ```powershell
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The Python API health check is `http://localhost:8000/health`; its interactive docs are at `http://localhost:8000/docs`. The .NET API calls `POST /api/ai/risk-summary` on the Python service. Override its base URL with the .NET configuration key `PythonAi:BaseUrl` (environment variable `PythonAi__BaseUrl`) if needed.
+The Python health check is `http://localhost:8000/health`; its interactive docs are at `http://localhost:8000/docs`. The .NET API calls the Python endpoint; change `PythonAi:BaseUrl` (environment variable `PythonAi__BaseUrl`) if the service runs at another address. Without `GROQ_API_KEY`, the Python service still starts, but AI summary requests return 503.
 
-On Windows PowerShell, script activation may be restricted by execution policy. In that case use `.venv\Scripts\python.exe -m pip install -r requirements.txt`, then `.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000` without activating the environment.
+If PowerShell blocks virtual-environment activation, use the environment's Python executable directly:
 
-Run the Python service tests with `.venv\Scripts\python.exe -m pip install -r requirements-dev.txt` followed by `.venv\Scripts\python.exe -m pytest -q` from `python-ai`.
-
-The API project links the root `risk_positions.csv` into its build output automatically. No separate database or seed command is required; the source file contains 50,000 data rows. The API reads it once at startup into memory.
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
 
 ## Features
 
 - AG Grid Community Infinite Row Model with 100-row server-backed blocks and bounded cache.
-- Server-side sorting and column filters for text, numeric values and dates. Free-text search covers trade ID, counterparty and commodity.
-- P&L and FX totals, row counts and group summaries are calculated over all rows matching the active filters, not just the visible grid block.
-- Commodity and book breakdowns; selecting a group applies that group as a grid filter. Commodity grouping includes signed position totals. Book grouping omits position sums because a book may contain commodities with unlike quantity units.
-- Select a grid row to inspect its trade details.
-- Export downloads a server-generated CSV containing all rows matching the active filters and search.
-- **AI summary** requests an evidence-grounded narrative for the complete active filter set. The browser calls .NET only; .NET computes `/api/risk-positions/summary` and forwards those aggregates to the separate Python LangChain agent. Groq credentials stay in the Python service.
+- Server-side sorting, text/numeric/date filters, and quick search across trade ID, counterparty, and commodity.
+- P&L, FX, and group summaries calculated across all matching rows, not only the visible page.
+- Commodity and book breakdowns; position totals are shown for commodity groups, not mixed-unit book groups.
+- Trade detail drilldown and server-generated CSV export for the active filters.
+- Optional AI narrative generated from aggregate data by the Python service; provider credentials stay in that service.
 
 ## API
 
 - `GET /api/risk-positions?startRow=0&endRow=100&sortModel=[]&filterModel={}&q=` — paginated rows and filtered count.
-- `GET /api/risk-positions/summary?groupBy=commodity&filterModel={}&q=` — filtered P&L / FX totals and full-result grouping.
-- `GET /api/risk-positions/export?sortModel=[]&filterModel={}&q=` — full-result CSV download for the matching filters.
-- `GET /api/risk-positions/summary/ai?groupBy=commodity&filterModel={}&q=` — .NET-to-Python narrative summary for matching aggregates.
-- `GET /api/health` — readiness check.
+- `GET /api/risk-positions/summary?groupBy=commodity&filterModel={}&q=` — filtered totals and grouped aggregates.
+- `GET /api/risk-positions/export?sortModel=[]&filterModel={}&q=` — CSV download for all matching rows.
+- `GET /api/risk-positions/summary/ai?groupBy=commodity&filterModel={}&q=` — AI narrative via the Python service.
+- `GET /api/health` — API health check.
 
-Filter and sort models use AG Grid's JSON model format. The API applies only whitelisted field filters and sort keys.
+Filter and sort parameters use AG Grid's JSON model format. The API accepts only whitelisted fields and sort keys.
+
+## Run Python tests
+
+From `python-ai`, install the development requirements and run pytest:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q
+```
 
 ## Project layout
 
-- `backend/Crr.Api/Controllers` — HTTP route and response handling.
-- `backend/Crr.Api/Services` — filtering, sorting, pagination, aggregation and CSV export logic.
-- `backend/Crr.Api/Repositories` — CSV-backed in-memory data access.
-- `backend/Crr.Api/Models` — position entity and API response models.
-- `frontend` — React + TypeScript app and AG Grid Community infinite grid.
-- `python-ai` — FastAPI service and LangChain agent for AI summaries; configure credentials in its local `.env`.
-- `risk_positions.csv` — provided synthetic dataset (50,000 rows).
-- `DESIGN.md` — architecture and tradeoffs.
+- `backend/Crr.Api/Controllers` — HTTP routes and response handling.
+- `backend/Crr.Api/Services` — database queries, filtering, summaries, export, and CSV import.
+- `backend/Crr.Api/Data` — EF Core PostgreSQL context and migrations.
+- `backend/Crr.Api/Models` — risk-position entity and API response models.
+- `frontend` — React + TypeScript UI and AG Grid.
+- `python-ai` — FastAPI service and LangChain agent for AI summaries.
+- `risk_positions.csv` — supplied synthetic dataset of 50,000 rows.
+- `DESIGN.md` — architecture decisions and tradeoffs.
+
+## Product preview
+
+![Product screenshot](./product-image.png)
+
+[Watch the product recording](<./product recording.mp4>)

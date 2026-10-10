@@ -16,33 +16,37 @@ public sealed class RiskPositionsController(
     /// <param name="sortModel">AG Grid sort model JSON array.</param>
     /// <param name="filterModel">AG Grid filter model JSON object.</param>
     /// <param name="search">Optional case-insensitive search over trade ID, counterparty, and commodity.</param>
+    /// <param name="cancellationToken">Cancels the database query when the client disconnects.</param>
     /// <returns>The requested page and the total number of matching rows.</returns>
     [ProducesResponseType(typeof(RiskPositionPage), StatusCodes.Status200OK)]
     [HttpGet]
-    public IActionResult GetPage(
+    public async Task<IActionResult> GetPage(
         [FromQuery] int? startRow,
         [FromQuery] int? endRow,
         [FromQuery] string? sortModel,
         [FromQuery] string? filterModel,
-        [FromQuery(Name = "q")] string? search)
+        [FromQuery(Name = "q")] string? search,
+        CancellationToken cancellationToken)
     {
         var start = Math.Max(startRow ?? 0, 0);
         var end = Math.Max(endRow ?? start + 100, start);
-        return Ok(riskPositionService.GetPage(start, end, sortModel, filterModel, search));
+        return Ok(await riskPositionService.GetPageAsync(start, end, sortModel, filterModel, search, cancellationToken));
     }
 
     /// <summary>Gets totals and grouping for all positions matching the active filters.</summary>
     /// <param name="groupBy">Grouping field: book or commodity. Defaults to commodity.</param>
     /// <param name="filterModel">AG Grid filter model JSON object.</param>
     /// <param name="search">Optional case-insensitive search over trade ID, counterparty, and commodity.</param>
+    /// <param name="cancellationToken">Cancels the database query when the client disconnects.</param>
     /// <returns>Filtered P&amp;L and FX totals with per-group aggregates.</returns>
     [ProducesResponseType(typeof(RiskPositionSummary), StatusCodes.Status200OK)]
     [HttpGet("summary")]
-    public IActionResult GetSummary(
+    public async Task<IActionResult> GetSummary(
         [FromQuery] string? groupBy,
         [FromQuery] string? filterModel,
-        [FromQuery(Name = "q")] string? search) =>
-        Ok(riskPositionService.GetSummary(groupBy ?? "commodity", filterModel, search));
+        [FromQuery(Name = "q")] string? search,
+        CancellationToken cancellationToken) =>
+        Ok(await riskPositionService.GetSummaryAsync(groupBy ?? "commodity", filterModel, search, cancellationToken));
 
     /// <summary>Generates an AI narrative from the complete filtered risk summary.</summary>
     /// <param name="groupBy">Grouping field: book or commodity. Defaults to commodity.</param>
@@ -59,7 +63,7 @@ public sealed class RiskPositionsController(
         [FromQuery(Name = "q")] string? search,
         CancellationToken cancellationToken)
     {
-        var filteredSummary = riskPositionService.GetSummary(groupBy ?? "commodity", filterModel, search);
+        var filteredSummary = await riskPositionService.GetSummaryAsync(groupBy ?? "commodity", filterModel, search, cancellationToken);
         try
         {
             return Ok(await pythonAiSummaryClient.GenerateAsync(filteredSummary, cancellationToken));
@@ -86,13 +90,15 @@ public sealed class RiskPositionsController(
     /// <param name="sortModel">AG Grid sort model JSON array.</param>
     /// <param name="filterModel">AG Grid filter model JSON object.</param>
     /// <param name="search">Optional case-insensitive search over trade ID, counterparty, and commodity.</param>
+    /// <param name="cancellationToken">Cancels the database query when the client disconnects.</param>
     /// <returns>A CSV attachment containing the filtered positions.</returns>
     [Produces("text/csv")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [HttpGet("export")]
-    public IActionResult Export(
+    public async Task<IActionResult> Export(
         [FromQuery] string? sortModel,
         [FromQuery] string? filterModel,
-        [FromQuery(Name = "q")] string? search) =>
-        File(riskPositionService.ExportCsv(sortModel, filterModel, search), "text/csv; charset=utf-8", "risk-positions.csv");
+        [FromQuery(Name = "q")] string? search,
+        CancellationToken cancellationToken) =>
+        File(await riskPositionService.ExportCsvAsync(sortModel, filterModel, search, cancellationToken), "text/csv; charset=utf-8", "risk-positions.csv");
 }

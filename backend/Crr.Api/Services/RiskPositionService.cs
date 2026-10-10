@@ -1,12 +1,14 @@
 using System.Globalization;
+using System.Linq.Expressions;
 using System.Text;
 using System.Text.Json;
+using Crr.Api.Data;
 using Crr.Api.Models;
-using Crr.Api.Repositories;
+using Microsoft.EntityFrameworkCore;
 
 namespace Crr.Api.Services;
 
-public sealed class RiskPositionService(IRiskPositionRepository repository) : IRiskPositionService
+public sealed class RiskPositionService(RiskPositionDbContext db) : IRiskPositionService
 {
     private static readonly HashSet<string> SortableColumns = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -15,52 +17,49 @@ public sealed class RiskPositionService(IRiskPositionRepository repository) : IR
     };
     private static readonly char[] CsvSpecialCharacters = [',', '"', '\r', '\n'];
 
-    public RiskPositionPage GetPage(int startRow, int endRow, string? sortModel, string? filterModel, string? search)
+    public async Task<RiskPositionPage> GetPageAsync(int startRow, int endRow, string? sortModel, string? filterModel, string? search, CancellationToken cancellationToken)
     {
-        var filtered = ApplyFilters(repository.GetAll(), filterModel, search).ToArray();
+        var query = ApplyFilters(db.RiskPositions.AsNoTracking(), filterModel, search);
+        var totalCount = await query.CountAsync(cancellationToken);
         var sort = ParseSort(sortModel);
-        IEnumerable<RiskPosition> ordered = sort is null
-            ? filtered.OrderBy(x => x.TradeId, StringComparer.Ordinal)
-            : Sort(filtered, sort.Value.Column, sort.Value.Descending);
-
-        var start = Math.Clamp(startRow, 0, filtered.Length);
+        var ordered = ApplySort(query, sort);
+        var start = Math.Clamp(startRow, 0, totalCount);
         var length = Math.Clamp(endRow - startRow, 0, 1_000);
-        return new RiskPositionPage(ordered.Skip(start).Take(length).ToArray(), filtered.Length);
+        var rows = await ordered.Skip(start).Take(length).ToListAsync(cancellationToken);
+        return new RiskPositionPage(rows, totalCount);
     }
 
-    public RiskPositionSummary GetSummary(string? groupBy, string? filterModel, string? search)
+    public async Task<RiskPositionSummary> GetSummaryAsync(string? groupBy, string? filterModel, string? search, CancellationToken cancellationToken)
     {
-        var rows = ApplyFilters(repository.GetAll(), filterModel, search).ToArray();
+        var rows = ApplyFilters(db.RiskPositions.AsNoTracking(), filterModel, search);
+        var totals = await rows.GroupBy(_ => 1).Select(g => new
+        {
+            RowCount = g.Count(),
+            Pnl = g.Sum(x => x.Pnl),
+            FxExposure = g.Sum(x => x.FxExposure)
+        }).SingleOrDefaultAsync(cancellationToken);
+
         var groupByBook = groupBy?.Equals("book", StringComparison.OrdinalIgnoreCase) == true;
-        var groups = rows.GroupBy(x => groupByBook ? x.Book : x.Commodity)
-            .Select(group => new RiskPositionGroup(
-                group.Key,
-                group.Count(),
-                group.Sum(x => x.Pnl),
-                group.Sum(x => x.FxExposure),
-                // Avoid adding quantities across different commodities in a trading book.
-                groupByBook ? null : group.Sum(x => x.Position)))
-            .OrderByDescending(x => Math.Abs(x.Pnl))
-            .ToArray();
+        var groups = groupByBook
+            ? await rows.GroupBy(x => x.Book)
+                .OrderByDescending(g => g.Sum(x => x.Pnl) < 0 ? -g.Sum(x => x.Pnl) : g.Sum(x => x.Pnl))
+                .Select(g => new RiskPositionGroup(g.Key, g.Count(), g.Sum(x => x.Pnl), g.Sum(x => x.FxExposure), null))
+                .ToArrayAsync(cancellationToken)
+            : await rows.GroupBy(x => x.Commodity)
+                .OrderByDescending(g => g.Sum(x => x.Pnl) < 0 ? -g.Sum(x => x.Pnl) : g.Sum(x => x.Pnl))
+                .Select(g => new RiskPositionGroup(g.Key, g.Count(), g.Sum(x => x.Pnl), g.Sum(x => x.FxExposure), g.Sum(x => x.Position)))
+                .ToArrayAsync(cancellationToken);
 
-        return new RiskPositionSummary(
-            rows.Length,
-            rows.Sum(x => x.Pnl),
-            rows.Sum(x => x.FxExposure),
-            groups);
+        return new RiskPositionSummary(totals?.RowCount ?? 0, totals?.Pnl ?? 0m, totals?.FxExposure ?? 0m, groups);
     }
 
-    public byte[] ExportCsv(string? sortModel, string? filterModel, string? search)
+    public async Task<byte[]> ExportCsvAsync(string? sortModel, string? filterModel, string? search, CancellationToken cancellationToken)
     {
-        var rows = ApplyFilters(repository.GetAll(), filterModel, search).ToArray();
-        var sort = ParseSort(sortModel);
-        IEnumerable<RiskPosition> ordered = sort is null
-            ? rows.OrderBy(x => x.TradeId, StringComparer.Ordinal)
-            : Sort(rows, sort.Value.Column, sort.Value.Descending);
-
-        var csv = new StringBuilder(rows.Length * 128);
+        var rows = await ApplySort(ApplyFilters(db.RiskPositions.AsNoTracking(), filterModel, search), ParseSort(sortModel))
+            .ToListAsync(cancellationToken);
+        var csv = new StringBuilder(rows.Count * 128);
         csv.AppendLine("tradeId,book,commodity,counterparty,region,instrumentType,position,currency,marketPrice,pnl,fxExposure,asOfDate");
-        foreach (var row in ordered)
+        foreach (var row in rows)
         {
             csv.Append(Csv(row.TradeId)).Append(',').Append(Csv(row.Book)).Append(',').Append(Csv(row.Commodity)).Append(',')
                 .Append(Csv(row.Counterparty)).Append(',').Append(Csv(row.Region)).Append(',').Append(Csv(row.InstrumentType)).Append(',')
@@ -69,17 +68,16 @@ public sealed class RiskPositionService(IRiskPositionRepository repository) : IR
                 .Append(row.FxExposure.ToString(CultureInfo.InvariantCulture)).Append(',')
                 .AppendLine(row.AsOfDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
         }
-
         return Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(csv.ToString())).ToArray();
     }
 
-    private static IEnumerable<RiskPosition> ApplyFilters(IEnumerable<RiskPosition> source, string? filterJson, string? search)
+    private static IQueryable<RiskPosition> ApplyFilters(IQueryable<RiskPosition> query, string? filterJson, string? search)
     {
-        var query = source;
         if (!string.IsNullOrWhiteSpace(search))
         {
-            var term = search.Trim();
-            query = query.Where(x => Contains(x.Counterparty, term) || Contains(x.Commodity, term) || Contains(x.TradeId, term));
+            var pattern = LikePattern(search.Trim(), "contains");
+            query = query.Where(x => EF.Functions.ILike(x.Counterparty, pattern)
+                || EF.Functions.ILike(x.Commodity, pattern) || EF.Functions.ILike(x.TradeId, pattern));
         }
 
         if (string.IsNullOrWhiteSpace(filterJson)) return query;
@@ -92,113 +90,151 @@ public sealed class RiskPositionService(IRiskPositionRepository repository) : IR
                 var model = filter.Value.Clone();
                 query = field switch
                 {
-                    "tradeId" => query.Where(x => TextMatch(x.TradeId, model)),
-                    "book" => query.Where(x => TextMatch(x.Book, model)),
-                    "commodity" => query.Where(x => TextMatch(x.Commodity, model)),
-                    "counterparty" => query.Where(x => TextMatch(x.Counterparty, model)),
-                    "region" => query.Where(x => TextMatch(x.Region, model)),
-                    "instrumentType" => query.Where(x => TextMatch(x.InstrumentType, model)),
-                    "currency" => query.Where(x => TextMatch(x.Currency, model)),
-                    "position" => query.Where(x => NumberMatch(x.Position, model)),
-                    "marketPrice" => query.Where(x => NumberMatch(x.MarketPrice, model)),
-                    "pnl" => query.Where(x => NumberMatch(x.Pnl, model)),
-                    "fxExposure" => query.Where(x => NumberMatch(x.FxExposure, model)),
-                    "asOfDate" => query.Where(x => DateMatch(x.AsOfDate, model)),
+                    "tradeId" => ApplyText(query, x => x.TradeId, model),
+                    "book" => ApplyText(query, x => x.Book, model),
+                    "commodity" => ApplyText(query, x => x.Commodity, model),
+                    "counterparty" => ApplyText(query, x => x.Counterparty, model),
+                    "region" => ApplyText(query, x => x.Region, model),
+                    "instrumentType" => ApplyText(query, x => x.InstrumentType, model),
+                    "currency" => ApplyText(query, x => x.Currency, model),
+                    "position" => ApplyNumber(query, x => x.Position, model),
+                    "marketPrice" => ApplyNumber(query, x => x.MarketPrice, model),
+                    "pnl" => ApplyNumber(query, x => x.Pnl, model),
+                    "fxExposure" => ApplyNumber(query, x => x.FxExposure, model),
+                    "asOfDate" => ApplyDate(query, x => x.AsOfDate, model),
                     _ => query
                 };
             }
         }
-        catch (JsonException)
-        {
-            // Ignore malformed client filter payloads; the grid still receives data.
-        }
-
+        catch (JsonException) { /* Preserve the existing behavior for malformed filters. */ }
         return query;
     }
 
-    private static bool TextMatch(string value, JsonElement model)
+    private static IQueryable<RiskPosition> ApplyText(IQueryable<RiskPosition> query, Expression<Func<RiskPosition, string>> selector, JsonElement model)
+    {
+        var body = BuildText(selector.Body, model);
+        return query.Where(Expression.Lambda<Func<RiskPosition, bool>>(body, selector.Parameters));
+    }
+
+    private static Expression BuildText(Expression value, JsonElement model)
     {
         if (model.TryGetProperty("values", out var values) && values.ValueKind == JsonValueKind.Array)
-            return values.EnumerateArray().Any(v => string.Equals(value, v.GetString(), StringComparison.OrdinalIgnoreCase));
-        if (model.TryGetProperty("conditions", out var conditions) && conditions.ValueKind == JsonValueKind.Array)
-        {
-            var matches = conditions.EnumerateArray().Select(condition => TextMatch(value, condition));
-            return model.TryGetProperty("operator", out var op) && op.GetString() == "OR" ? matches.Any(x => x) : matches.All(x => x);
-        }
-        if (model.TryGetProperty("condition1", out var condition1))
-        {
-            var first = TextMatch(value, condition1);
-            var second = model.TryGetProperty("condition2", out var condition2) && TextMatch(value, condition2);
-            return model.TryGetProperty("operator", out var op) && op.GetString() == "OR" ? first || second : first && second;
-        }
+            return Combine(values.EnumerateArray().Select(v => TextEquals(value, v.GetString() ?? "")).ToArray(), false);
+        if (TryConditions(model, out var conditions, out var useOr))
+            return Combine(conditions.Select(c => BuildText(value, c)).ToArray(), useOr);
+        var type = model.TryGetProperty("type", out var t) ? t.GetString() : "contains";
+        var term = model.TryGetProperty("filter", out var f) && f.ValueKind == JsonValueKind.String ? f.GetString() ?? "" : "";
+        if (type == "equals") return TextEquals(value, term);
+        if (type == "notEqual") return Expression.Not(TextEquals(value, term));
+        return ILike(value, LikePattern(term, type switch { "startsWith" => "startsWith", "endsWith" => "endsWith", _ => "contains" }));
+    }
 
-        var type = model.TryGetProperty("type", out var filterType) ? filterType.GetString() : "contains";
-        var term = model.TryGetProperty("filter", out var filter) && filter.ValueKind == JsonValueKind.String
-            ? filter.GetString() ?? ""
-            : "";
+    private static IQueryable<RiskPosition> ApplyNumber(IQueryable<RiskPosition> query, Expression<Func<RiskPosition, decimal>> selector, JsonElement model)
+    {
+        var body = BuildNumber(selector.Body, model);
+        return query.Where(Expression.Lambda<Func<RiskPosition, bool>>(body, selector.Parameters));
+    }
+
+    private static Expression BuildNumber(Expression value, JsonElement model)
+    {
+        if (TryConditions(model, out var conditions, out var useOr)) return Combine(conditions.Select(c => BuildNumber(value, c)).ToArray(), useOr);
+        if (!model.TryGetProperty("filter", out var filter) || !TryDecimal(filter, out var number)) return Expression.Constant(true);
+        var type = model.TryGetProperty("type", out var t) ? t.GetString() : "equals";
+        var left = Expression.Convert(value, typeof(decimal));
+        var right = Expression.Constant(number);
         return type switch
         {
-            "equals" => value.Equals(term, StringComparison.OrdinalIgnoreCase),
-            "notEqual" => !value.Equals(term, StringComparison.OrdinalIgnoreCase),
-            "startsWith" => value.StartsWith(term, StringComparison.OrdinalIgnoreCase),
-            "endsWith" => value.EndsWith(term, StringComparison.OrdinalIgnoreCase),
-            _ => Contains(value, term)
+            "notEqual" => Expression.NotEqual(left, right),
+            "lessThan" => Expression.LessThan(left, right),
+            "lessThanOrEqual" => Expression.LessThanOrEqual(left, right),
+            "greaterThan" => Expression.GreaterThan(left, right),
+            "greaterThanOrEqual" => Expression.GreaterThanOrEqual(left, right),
+            "inRange" when model.TryGetProperty("filterTo", out var to) && TryDecimal(to, out var upper) => Expression.AndAlso(Expression.GreaterThanOrEqual(left, right), Expression.LessThanOrEqual(left, Expression.Constant(upper))),
+            _ => Expression.Equal(left, right)
         };
     }
 
-    private static bool NumberMatch(decimal value, JsonElement model)
+    private static IQueryable<RiskPosition> ApplyDate(IQueryable<RiskPosition> query, Expression<Func<RiskPosition, DateOnly>> selector, JsonElement model)
     {
-        if (model.TryGetProperty("conditions", out var conditions) && conditions.ValueKind == JsonValueKind.Array)
-        {
-            var matches = conditions.EnumerateArray().Select(condition => NumberMatch(value, condition));
-            return model.TryGetProperty("operator", out var op) && op.GetString() == "OR" ? matches.Any(x => x) : matches.All(x => x);
-        }
-        if (model.TryGetProperty("condition1", out var condition1))
-        {
-            var first = NumberMatch(value, condition1);
-            var second = model.TryGetProperty("condition2", out var condition2) && NumberMatch(value, condition2);
-            return model.TryGetProperty("operator", out var op) && op.GetString() == "OR" ? first || second : first && second;
-        }
-        if (!model.TryGetProperty("filter", out var filter) || !TryDecimal(filter, out var number)) return true;
+        var body = BuildDate(selector.Body, model);
+        return query.Where(Expression.Lambda<Func<RiskPosition, bool>>(body, selector.Parameters));
+    }
 
-        var type = model.TryGetProperty("type", out var filterType) ? filterType.GetString() : "equals";
+    private static Expression BuildDate(Expression value, JsonElement model)
+    {
+        if (TryConditions(model, out var conditions, out var useOr)) return Combine(conditions.Select(c => BuildDate(value, c)).ToArray(), useOr);
+        if (!model.TryGetProperty("dateFrom", out var dateValue) || !DateOnly.TryParse(dateValue.GetString(), CultureInfo.InvariantCulture, out var date)) return Expression.Constant(true);
+        var left = Expression.Convert(value, typeof(DateOnly));
+        var right = Expression.Constant(date);
+        var type = model.TryGetProperty("type", out var t) ? t.GetString() : "equals";
         return type switch
         {
-            "notEqual" => value != number,
-            "lessThan" => value < number,
-            "lessThanOrEqual" => value <= number,
-            "greaterThan" => value > number,
-            "greaterThanOrEqual" => value >= number,
-            "inRange" => model.TryGetProperty("filterTo", out var to) && TryDecimal(to, out var upper) && value >= number && value <= upper,
-            _ => value == number
+            "notEqual" => Expression.NotEqual(left, right),
+            "lessThan" => Expression.LessThan(left, right),
+            "greaterThan" => Expression.GreaterThan(left, right),
+            "inRange" when model.TryGetProperty("dateTo", out var to) && DateOnly.TryParse(to.GetString(), CultureInfo.InvariantCulture, out var upper) => Expression.AndAlso(Expression.GreaterThanOrEqual(left, right), Expression.LessThanOrEqual(left, Expression.Constant(upper))),
+            _ => Expression.Equal(left, right)
         };
     }
 
-    private static bool DateMatch(DateOnly value, JsonElement model)
+    private static bool TryConditions(JsonElement model, out IReadOnlyList<JsonElement> conditions, out bool useOr)
     {
-        if (!model.TryGetProperty("dateFrom", out var dateElement) || !DateOnly.TryParse(dateElement.GetString(), out var date)) return true;
-        var type = model.TryGetProperty("type", out var filterType) ? filterType.GetString() : "equals";
-        return type switch
+        useOr = model.TryGetProperty("operator", out var op) && op.GetString() == "OR";
+        if (model.TryGetProperty("conditions", out var many) && many.ValueKind == JsonValueKind.Array) { conditions = many.EnumerateArray().Select(x => x.Clone()).ToArray(); return true; }
+        if (model.TryGetProperty("condition1", out var first) && model.TryGetProperty("condition2", out var second))
         {
-            "notEqual" => value != date,
-            "lessThan" => value < date,
-            "greaterThan" => value > date,
-            "inRange" when model.TryGetProperty("dateTo", out var to) && DateOnly.TryParse(to.GetString(), out var upper) => value >= date && value <= upper,
-            _ => value == date
-        };
+            conditions = [first.Clone(), second.Clone()];
+            return true;
+        }
+        conditions = [];
+        return false;
     }
 
-    private static bool TryDecimal(JsonElement element, out decimal value)
+    private static Expression Combine(IReadOnlyList<Expression> expressions, bool useOr)
     {
-        if (element.ValueKind == JsonValueKind.Number) return element.TryGetDecimal(out value);
-        return decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out value);
+        if (expressions.Count == 0) return Expression.Constant(!useOr);
+        return expressions.Aggregate((left, right) => useOr ? Expression.OrElse(left, right) : Expression.AndAlso(left, right));
     }
 
-    private static bool Contains(string value, string term) => value.Contains(term, StringComparison.OrdinalIgnoreCase);
+    private static Expression TextEquals(Expression value, string term) => ILike(value, LikePattern(term, "equals"));
 
-    private static string Csv(string value) => value.IndexOfAny(CsvSpecialCharacters) >= 0
-        ? $"\"{value.Replace("\"", "\"\"")}\""
-        : value;
+    private static Expression ILike(Expression value, string pattern)
+    {
+        var method = typeof(NpgsqlDbFunctionsExtensions).GetMethod(nameof(NpgsqlDbFunctionsExtensions.ILike), [typeof(DbFunctions), typeof(string), typeof(string)])!;
+        return Expression.Call(method, Expression.Constant(EF.Functions), value, Expression.Constant(pattern));
+    }
+
+    private static string LikePattern(string value, string type)
+    {
+        var escaped = value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+        return type switch { "contains" => $"%{escaped}%", "startsWith" => $"{escaped}%", "endsWith" => $"%{escaped}", _ => escaped };
+    }
+
+    private static bool TryDecimal(JsonElement element, out decimal value) => element.ValueKind == JsonValueKind.Number
+        ? element.TryGetDecimal(out value)
+        : decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out value);
+
+    private static IOrderedQueryable<RiskPosition> ApplySort(IQueryable<RiskPosition> query, (string Column, bool Descending)? sort)
+    {
+        var column = sort?.Column.ToLowerInvariant() ?? "tradeid";
+        var descending = sort?.Descending ?? false;
+        IOrderedQueryable<RiskPosition> ordered = (column, descending) switch
+        {
+            ("book", false) => query.OrderBy(x => x.Book), ("book", true) => query.OrderByDescending(x => x.Book),
+            ("commodity", false) => query.OrderBy(x => x.Commodity), ("commodity", true) => query.OrderByDescending(x => x.Commodity),
+            ("counterparty", false) => query.OrderBy(x => x.Counterparty), ("counterparty", true) => query.OrderByDescending(x => x.Counterparty),
+            ("region", false) => query.OrderBy(x => x.Region), ("region", true) => query.OrderByDescending(x => x.Region),
+            ("instrumenttype", false) => query.OrderBy(x => x.InstrumentType), ("instrumenttype", true) => query.OrderByDescending(x => x.InstrumentType),
+            ("position", false) => query.OrderBy(x => x.Position), ("position", true) => query.OrderByDescending(x => x.Position),
+            ("currency", false) => query.OrderBy(x => x.Currency), ("currency", true) => query.OrderByDescending(x => x.Currency),
+            ("marketprice", false) => query.OrderBy(x => x.MarketPrice), ("marketprice", true) => query.OrderByDescending(x => x.MarketPrice),
+            ("pnl", false) => query.OrderBy(x => x.Pnl), ("pnl", true) => query.OrderByDescending(x => x.Pnl),
+            ("fxexposure", false) => query.OrderBy(x => x.FxExposure), ("fxexposure", true) => query.OrderByDescending(x => x.FxExposure),
+            ("asofdate", false) => query.OrderBy(x => x.AsOfDate), ("asofdate", true) => query.OrderByDescending(x => x.AsOfDate),
+            (_, false) => query.OrderBy(x => x.TradeId), (_, true) => query.OrderByDescending(x => x.TradeId)
+        };
+        return column == "tradeid" ? ordered : ordered.ThenBy(x => x.TradeId);
+    }
 
     private static (string Column, bool Descending)? ParseSort(string? json)
     {
@@ -212,30 +248,8 @@ public sealed class RiskPositionService(IRiskPositionRepository repository) : IR
             if (name is null || !SortableColumns.Contains(name)) return null;
             return (name, first.TryGetProperty("sort", out var direction) && direction.GetString() == "desc");
         }
-        catch (JsonException)
-        {
-            return null;
-        }
+        catch (JsonException) { return null; }
     }
 
-    private static IOrderedEnumerable<RiskPosition> Sort(IEnumerable<RiskPosition> rows, string column, bool descending)
-    {
-        Func<RiskPosition, object> key = column.ToLowerInvariant() switch
-        {
-            "tradeid" => x => x.TradeId,
-            "book" => x => x.Book,
-            "commodity" => x => x.Commodity,
-            "counterparty" => x => x.Counterparty,
-            "region" => x => x.Region,
-            "instrumenttype" => x => x.InstrumentType,
-            "position" => x => x.Position,
-            "currency" => x => x.Currency,
-            "marketprice" => x => x.MarketPrice,
-            "pnl" => x => x.Pnl,
-            "fxexposure" => x => x.FxExposure,
-            "asofdate" => x => x.AsOfDate,
-            _ => x => x.TradeId
-        };
-        return descending ? rows.OrderByDescending(key) : rows.OrderBy(key);
-    }
+    private static string Csv(string value) => value.IndexOfAny(CsvSpecialCharacters) >= 0 ? $"\"{value.Replace("\"", "\"\"")}\"" : value;
 }
