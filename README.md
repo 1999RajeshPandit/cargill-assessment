@@ -2,6 +2,12 @@
 
 A full-stack risk-position reporting slice built with .NET 10, React, TypeScript, AG Grid Community, and a separate Python AI summary API. It serves the supplied 50,000-row dataset through a server-paginated API and reports filtered totals across the complete matching result set.
 
+## Product preview
+
+![Product screenshot](./product-image.png)
+
+[Watch the product recording](<./product recording.mp4>)
+
 ## Requirements
 
 - .NET 10 SDK
