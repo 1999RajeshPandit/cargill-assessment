@@ -2,6 +2,31 @@
 
 A full-stack risk-position reporting app built with .NET 10, React, TypeScript, AG Grid Community, PostgreSQL, and a separate Python AI summary API. The supplied CSV contains 50,000 positions.
 
+## Product preview
+
+![Product screenshot](./product-image.png)
+
+### Watch the product walkthrough
+
+<video controls preload="metadata" width="100%" poster="./product-image.png">
+  <source src="./product%20recording.mp4" type="video/mp4">
+  Your browser does not support embedded video. [Open the product recording](./product%20recording.mp4).
+</video>
+
+If the README viewer does not support embedded video, [open or download the recording](<./product recording.mp4>).
+
+## Project layout
+
+- `backend/Crr.Api/Controllers` — HTTP routes and response handling.
+- `backend/Crr.Api/Services` — database queries, filtering, summaries, export, and CSV import.
+- `backend/Crr.Api/Data` — EF Core PostgreSQL context and migrations.
+- `backend/Crr.Api/Models` — risk-position entity and API response models.
+- `frontend` — React + TypeScript UI and AG Grid.
+- `python-ai` — FastAPI service and LangChain agent for AI summaries.
+- `risk_positions.csv` — supplied synthetic dataset of 50,000 rows.
+- `DESIGN.md` — architecture decisions and tradeoffs.
+
+
 > **Want to skip PostgreSQL setup?** Switch to the `csv_in_memory` branch with `git checkout csv_in_memory`. That branch loads the CSV into memory, so you can go straight to [Run all three applications](#run-all-three-applications).
 
 ## PostgreSQL setup
@@ -114,19 +139,4 @@ From `python-ai`, install the development requirements and run pytest:
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-## Project layout
 
-- `backend/Crr.Api/Controllers` — HTTP routes and response handling.
-- `backend/Crr.Api/Services` — database queries, filtering, summaries, export, and CSV import.
-- `backend/Crr.Api/Data` — EF Core PostgreSQL context and migrations.
-- `backend/Crr.Api/Models` — risk-position entity and API response models.
-- `frontend` — React + TypeScript UI and AG Grid.
-- `python-ai` — FastAPI service and LangChain agent for AI summaries.
-- `risk_positions.csv` — supplied synthetic dataset of 50,000 rows.
-- `DESIGN.md` — architecture decisions and tradeoffs.
-
-## Product preview
-
-![Product screenshot](./product-image.png)
-
-[Watch the product recording](<./product recording.mp4>)
